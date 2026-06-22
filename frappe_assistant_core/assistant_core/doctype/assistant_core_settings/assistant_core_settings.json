@@ -43,6 +43,11 @@
   "mcp_transport_type",
   "skills_section",
   "skill_mode",
+  "mandatory_identity_skill_id",
+  "fail_if_identity_skill_missing",
+  "enable_context_files",
+  "enable_business_output_normalizer",
+  "enable_final_output_guard",
   "oauth_tab",
   "oauth_authorization_section",
   "enable_dynamic_client_registration",
@@ -299,6 +304,41 @@
    "fieldtype": "Select",
    "label": "Skill Mode",
    "options": "supplementary\nreplace"
+  },
+  {
+   "default": "platia_identity",
+   "description": "Load the mandatory identity and behavior policy skill",
+   "fieldname": "mandatory_identity_skill_id",
+   "fieldtype": "Data",
+   "label": "Mandatory Identity Skill ID"
+  },
+  {
+   "default": "1",
+   "description": "MCP server will fail to initialize if the mandatory identity skill is missing or not Published.",
+   "fieldname": "fail_if_identity_skill_missing",
+   "fieldtype": "Check",
+   "label": "Fail If Identity Skill Missing"
+  },
+  {
+   "default": "0",
+   "description": "Allows loading client-specific context files as secondary instructions.",
+   "fieldname": "enable_context_files",
+   "fieldtype": "Check",
+   "label": "Enable Context Files"
+  },
+  {
+   "default": "1",
+   "description": "Normalizes all tool lists, definitions, calls, and errors dynamically to strip restricted platform terminology.",
+   "fieldname": "enable_business_output_normalizer",
+   "fieldtype": "Check",
+   "label": "Enable Business Output Normalizer"
+  },
+  {
+   "default": "1",
+   "description": "Enforces output guidelines on the final assistant text generated in the UI.",
+   "fieldname": "enable_final_output_guard",
+   "fieldtype": "Check",
+   "label": "Enable Final Output Guard"
   },
   {
    "fieldname": "oauth_tab",

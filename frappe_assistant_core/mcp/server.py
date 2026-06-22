@@ -36,6 +36,24 @@ from typing import Any, Dict, Optional
 
 from werkzeug.wrappers import Request, Response
 
+from frappe_assistant_core.policy.identity_policy import (
+    PolicyError,
+    load_mandatory_identity_policy,
+    load_context_files_for_current_user,
+    build_tool_usage_guidance,
+    build_mcp_instructions,
+    audit_policy_loaded,
+)
+from frappe_assistant_core.policy.business_output_normalizer import (
+    HIDDEN_FIELDS,
+    RAW_TO_SAFE_TOOL_NAMES,
+    normalize_text,
+    normalize_for_business_user,
+    business_safe_error_message,
+    reverse_tool_name_mapping,
+    audit_tool_result_normalized,
+)
+
 
 class MCPServer:
     """
@@ -232,6 +250,9 @@ class MCPServer:
             else:
                 frappe.logger().warning(f"MCP Unknown method: {method}")
                 return self._error_response(response, request_id, -32601, f"Method not found: {method}")
+        except PolicyError as e:
+            frappe.logger().warning(f"MCP Policy Error: {str(e)}")
+            return self._error_response(response, request_id, -32000, str(e))
         except Exception as e:
             # Log unexpected errors
             frappe.logger().error(
@@ -289,32 +310,64 @@ class MCPServer:
     def _handle_initialize(self, params: Dict) -> Dict:
         """
         Handle initialize request.
-
-        Declares server capabilities according to MCP 2025-06-18 spec.
-        We only support tools (not prompts, resources, or sampling).
+        Loads the mandatory platia_identity policy and builds initialize response instructions.
         """
         import frappe
 
-        # Get protocol version from settings
-        protocol_version = "2025-06-18"  # Default
+        # Load policy first (fails-closed if missing or not Published)
+        policy = load_mandatory_identity_policy()
+
+        # Get settings
+        protocol_version = "2025-06-18"
         try:
             settings = frappe.get_single("Assistant Core Settings")
             protocol_version = settings.mcp_protocol_version or protocol_version
         except Exception:
             pass
 
+        # Build instructions
+        optional_context = load_context_files_for_current_user()
+        tool_usage_guidance = build_tool_usage_guidance()
+        instructions = build_mcp_instructions(
+            identity_policy=policy["content"],
+            optional_context=optional_context,
+            tool_usage_guidance=tool_usage_guidance,
+        )
+
+        # Audit policy loading
+        client_info = params.get("clientInfo", {})
+        client_name = client_info.get("name", "unknown")
+        request_id = getattr(frappe.local, "assistant_session_id", None) or "unknown"
+        
+        audit_policy_loaded(
+            event="mcp_initialize_policy_loaded",
+            skill_id=policy["skill_id"],
+            record_name=policy["record_name"],
+            policy_hash=policy["version_hash"],
+            request_id=request_id,
+            user=frappe.session.user,
+            client=client_name,
+        )
+
+        # Business-safe server info
+        server_info = {
+            "name": "Platia 360 MCP",
+            "version": "2.0.0",
+        }
+
         return {
             "protocolVersion": protocol_version,
             "capabilities": {
-                "tools": {},  # We support tools
-                "prompts": {},  # We support prompts (database-driven templates)
-                "resources": {},  # We support resources (skill documents)
+                "tools": {"listChanged": True},
+                "prompts": {},
+                "resources": {"subscribe": True, "listChanged": True},
             },
-            "serverInfo": {"name": self.name, "version": "2.0.0"},
+            "serverInfo": server_info,
+            "instructions": instructions,
         }
 
     def _handle_tools_list(self, params: Dict, tool_registry: Optional[Dict] = None) -> Dict:
-        """Handle tools/list request with optional token optimization."""
+        """Handle tools/list request with optional token optimization and policy normalization."""
         import frappe
 
         if tool_registry is None:
@@ -331,8 +384,9 @@ class MCPServer:
 
                 skill_replace_map = get_skill_manager().get_tool_skill_map()
         except Exception:
-            pass
+            settings = None
 
+        # Build tools list
         for tool in tool_registry.values():
             description = tool["description"]
 
@@ -347,20 +401,42 @@ class MCPServer:
                 "inputSchema": tool["inputSchema"],
             }
 
-            # Add annotations if present
             if tool.get("annotations"):
-                tool_spec["annotations"] = tool["annotations"]
+                tool_spec["annotations"] = tool.get("annotations")
+
+            # Normalization
+            if settings and getattr(settings, "enable_business_output_normalizer", True):
+                # Hide raw app inventory tools (which leak raw app information)
+                if tool["name"] in ("list_installed_apps", "get_installed_apps"):
+                    continue
+
+                # Rename and normalize
+                name = tool_spec["name"]
+                safe_name = RAW_TO_SAFE_TOOL_NAMES.get(name, name)
+                
+                tool_spec["name"] = safe_name
+                tool_spec["description"] = normalize_text(tool_spec["description"])
+                tool_spec["inputSchema"] = normalize_for_business_user(tool_spec["inputSchema"])
 
             tools_list.append(tool_spec)
+
+        # Expose platia_environment_summary tool
+        if settings and getattr(settings, "enable_business_output_normalizer", True):
+            platia_env_tool = {
+                "name": "platia_environment_summary",
+                "description": "Get a summary of the Platia 360 environment including active business areas and ownership information.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                }
+            }
+            tools_list.append(platia_env_tool)
 
         return {"tools": tools_list}
 
     def _handle_tools_call(self, params: Dict, tool_registry: Optional[Dict] = None) -> Dict:
         """
-        Handle tools/call request.
-
-        This is the CRITICAL method that fixes the serialization issue.
-        Uses json.dumps with default=str to handle datetime, Decimal, etc.
+        Handle tools/call request with name reverse mapping and business user normalization.
         """
         import frappe
 
@@ -372,8 +448,47 @@ class MCPServer:
 
         frappe.logger().debug(f"MCP _handle_tools_call: tool={tool_name}, args={arguments}")
 
+        try:
+            settings = frappe.get_single("Assistant Core Settings")
+        except Exception:
+            settings = None
+
+        # Direct execution for platia_environment_summary
+        if tool_name == "platia_environment_summary":
+            env_result = {
+                "platform": "Platia 360",
+                "assistant": "Platia 360 AI Assistant",
+                "owner": "Platia 360 LLC FZ",
+                "business_areas": [
+                    "Accounting",
+                    "Financial Reports",
+                    "Receivables",
+                    "Payables",
+                    "Buying",
+                    "Selling",
+                    "Stock",
+                    "Manufacturing",
+                    "CRM",
+                    "HR",
+                    "Payroll",
+                    "Projects",
+                    "Quality",
+                    "Assets",
+                    "Support",
+                    "Compliance",
+                    "AI Assistant"
+                ]
+            }
+            return {
+                "content": [{"type": "text", "text": json.dumps(env_result, indent=2)}],
+                "isError": False
+            }
+
+        # Reverse map name (e.g. get_business_record -> get_document)
+        real_tool_name = reverse_tool_name_mapping(tool_name)
+
         # Check tool exists
-        if tool_name not in tool_registry:
+        if real_tool_name not in tool_registry:
             error_msg = f"Tool '{tool_name}' not found. Available tools: {list(tool_registry.keys())}"
             frappe.logger().error(f"MCP Tool Not Found: {error_msg}")
             return {
@@ -381,30 +496,45 @@ class MCPServer:
                 "isError": True,
             }
 
-        tool = tool_registry[tool_name]
+        tool = tool_registry[real_tool_name]
         fn = tool["fn"]
 
         try:
             # Execute tool
-            frappe.logger().info(f"MCP Executing tool: {tool_name}")
+            frappe.logger().info(f"MCP Executing tool: {real_tool_name}")
             result = fn(**arguments)
             frappe.logger().info(
-                f"MCP Tool {tool_name} executed successfully, result type: {type(result).__name__}"
+                f"MCP Tool {real_tool_name} executed successfully, result type: {type(result).__name__}"
             )
 
-            # Extract image content for vision API (e.g., screenshot tool).
-            # Tools can include _image_content in their result to have the LLM
-            # see the image directly via vision, rather than just getting metadata.
-            # Note: BaseTool._safe_execute() wraps tool output as:
-            #   {"success": True, "result": <tool_output>, "execution_time": ...}
-            # so _image_content lives inside result["result"], not at the top level.
+            # Extract image content
             image_content = None
             if isinstance(result, dict):
                 inner = result.get("result")
                 if isinstance(inner, dict) and "_image_content" in inner:
                     image_content = inner.pop("_image_content")
 
-            # Serialize the text result (default=str handles datetime, Decimal, etc.)
+            # Output Normalization
+            fields_hidden = set()
+            terms_replaced = 0
+            
+            if settings and getattr(settings, "enable_business_output_normalizer", True):
+                # Count normalizations/hidden fields before converting to text
+                if isinstance(result, dict):
+                    for hidden in HIDDEN_FIELDS:
+                        if hidden in result:
+                            fields_hidden.add(hidden)
+                
+                # Normalize result
+                result = normalize_for_business_user(result)
+
+                # Count terms replaced in result text (approximate count for audit log)
+                original_str = str(result)
+                normalized_str = normalize_text(original_str)
+                if original_str != normalized_str:
+                    terms_replaced = 1
+
+            # Serialize result
             if isinstance(result, str):
                 result_text = result
             else:
@@ -413,7 +543,6 @@ class MCPServer:
             # Build MCP content blocks
             content = [{"type": "text", "text": result_text}]
 
-            # Add image block for vision API if tool provided one
             if image_content and isinstance(image_content, dict):
                 mime_map = {
                     "jpeg": "image/jpeg",
@@ -431,14 +560,25 @@ class MCPServer:
                     }
                 )
 
+            # Audit normalization
+            if settings and getattr(settings, "enable_business_output_normalizer", True):
+                request_id = getattr(frappe.local, "assistant_session_id", None) or "unknown"
+                audit_tool_result_normalized(
+                    tool_name=tool_name,
+                    user=frappe.session.user,
+                    request_id=request_id,
+                    fields_hidden=fields_hidden,
+                    terms_replaced=terms_replaced,
+                )
+
             return {"content": content, "isError": False}
 
         except Exception as e:
-            # Full traceback for debugging
-            error_text = f"Error executing {tool_name}: {str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            frappe.logger().error(f"MCP Tool Execution Error: {error_text}")
+            # Wrap error to business-safe message
+            safe_error_text = business_safe_error_message(tool_name, e)
+            frappe.logger().error(f"MCP Tool Execution Error wrapped: {safe_error_text}")
 
-            return {"content": [{"type": "text", "text": error_text}], "isError": True}
+            return {"content": [{"type": "text", "text": safe_error_text}], "isError": True}
 
     def _success_response(self, response: Response, request_id: Any, result: Dict) -> Response:
         """Create JSON-RPC success response."""

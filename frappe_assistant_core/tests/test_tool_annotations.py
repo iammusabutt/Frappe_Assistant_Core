@@ -134,15 +134,15 @@ class TestToolsListEmitsAnnotations(BaseAssistantTest):
 
         server = MCPServer("test")
         tool_registry = OrderedDict()
-        tool_registry["get_document"] = {
-            "name": "get_document",
+        tool_registry["read_document"] = {
+            "name": "read_document",
             "description": "Read a document",
             "inputSchema": {"type": "object", "properties": {}},
             "annotations": {"readOnlyHint": True},
             "fn": lambda **kw: {},
         }
-        tool_registry["delete_document"] = {
-            "name": "delete_document",
+        tool_registry["trash_document"] = {
+            "name": "trash_document",
             "description": "Delete a document",
             "inputSchema": {"type": "object", "properties": {}},
             "annotations": {"readOnlyHint": False, "destructiveHint": True},
@@ -152,9 +152,9 @@ class TestToolsListEmitsAnnotations(BaseAssistantTest):
         result = server._handle_tools_list({}, tool_registry)
 
         by_name = {t["name"]: t for t in result["tools"]}
-        self.assertEqual(by_name["get_document"]["annotations"], {"readOnlyHint": True})
+        self.assertEqual(by_name["read_document"]["annotations"], {"readOnlyHint": True})
         self.assertEqual(
-            by_name["delete_document"]["annotations"],
+            by_name["trash_document"]["annotations"],
             {"readOnlyHint": False, "destructiveHint": True},
         )
 

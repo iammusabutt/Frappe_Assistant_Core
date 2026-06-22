@@ -40,6 +40,9 @@ frappe.pages['fac-admin'].on_page_load = function(wrapper) {
                         <button class="btn btn-sm btn-primary" id="toggle-server">
                             <span id="toggle-server-text">Loading...</span>
                         </button>
+                        <button class="btn btn-sm btn-default" id="open-context-files">
+                            <i class="fa fa-file-text"></i> Context Files
+                        </button>
                         <button class="btn btn-sm btn-default" id="open-settings">
                             <i class="fa fa-cog"></i> Settings
                         </button>
@@ -256,6 +259,9 @@ frappe.pages['fac-admin'].on_page_load = function(wrapper) {
 
         // Server toggle
         $('#toggle-server').on('click', ns.toggleServer);
+        $('#open-context-files').on('click', function() {
+            frappe.set_route('List', 'FAC Context File');
+        });
         $('#open-settings').on('click', function() {
             frappe.set_route('Form', 'Assistant Core Settings');
         });

@@ -80,3 +80,11 @@ class FACSkill(Document):
     def clear_skill_cache(self):
         """Clear skill-related caches."""
         frappe.cache.hdel("skills", frappe.local.site)
+        try:
+            settings = frappe.get_single("Assistant Core Settings")
+            required_id = getattr(settings, "mandatory_identity_skill_id", None) or "platia_identity"
+        except Exception:
+            required_id = "platia_identity"
+
+        if self.skill_id in ("platia_identity", required_id):
+            frappe.cache.delete_key("fac_policy_identity_platia_identity")
