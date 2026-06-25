@@ -179,6 +179,12 @@ class MCPServer:
         """
         import frappe
 
+        try:
+            settings = frappe.get_single("Assistant Core Settings")
+        except Exception:
+            settings = None
+        enable_normalizer = getattr(settings, "enable_business_output_normalizer", True) if settings else True
+
         # Per-request registry isolates concurrent requests. Never mutate the
         # shared singleton during request handling.
         if tool_registry is None:
@@ -237,14 +243,22 @@ class MCPServer:
                 result = self._handle_tools_call(params, tool_registry)
             elif method == "resources/list":
                 result = self._handle_resources_list(params, request_id)
+                if enable_normalizer:
+                    result = normalize_for_business_user(result)
             elif method == "resources/read":
                 result = self._handle_resources_read(params, request_id)
+                if enable_normalizer:
+                    result = normalize_for_business_user(result)
             elif method == "resources/templates/list":
                 result = {"resourceTemplates": []}
             elif method == "prompts/list":
                 result = self._handle_prompts_list(params, request_id)
+                if enable_normalizer:
+                    result = normalize_for_business_user(result)
             elif method == "prompts/get":
                 result = self._handle_prompts_get(params, request_id)
+                if enable_normalizer:
+                    result = normalize_for_business_user(result)
             elif method == "ping":
                 result = {}
             else:
@@ -258,7 +272,7 @@ class MCPServer:
             frappe.logger().error(
                 f"MCP Handler Error for method '{method}': {str(e)}\n{traceback.format_exc()}"
             )
-            return self._error_response(response, request_id, -32603, f"Internal error: {str(e)}")
+            return self._error_response(response, request_id, -32603, business_safe_error_message("jsonrpc", e))
 
         # Success response
         return self._success_response(response, request_id, result)
@@ -386,6 +400,8 @@ class MCPServer:
         except Exception:
             settings = None
 
+        enable_normalizer = getattr(settings, "enable_business_output_normalizer", True) if settings else True
+
         # Build tools list
         for tool in tool_registry.values():
             description = tool["description"]
@@ -405,7 +421,7 @@ class MCPServer:
                 tool_spec["annotations"] = tool.get("annotations")
 
             # Normalization
-            if settings and getattr(settings, "enable_business_output_normalizer", True):
+            if enable_normalizer:
                 # Hide raw app inventory tools (which leak raw app information)
                 if tool["name"] in ("list_installed_apps", "get_installed_apps"):
                     continue
@@ -421,7 +437,7 @@ class MCPServer:
             tools_list.append(tool_spec)
 
         # Expose platia_environment_summary tool
-        if settings and getattr(settings, "enable_business_output_normalizer", True):
+        if enable_normalizer:
             platia_env_tool = {
                 "name": "platia_environment_summary",
                 "description": "Get a summary of the Platia 360 environment including active business areas and ownership information.",
@@ -489,7 +505,8 @@ class MCPServer:
 
         # Check tool exists
         if real_tool_name not in tool_registry:
-            error_msg = f"Tool '{tool_name}' not found. Available tools: {list(tool_registry.keys())}"
+            safe_available = [RAW_TO_SAFE_TOOL_NAMES.get(n, n) for n in tool_registry.keys()]
+            error_msg = f"Tool '{tool_name}' not found. Available tools: {safe_available}"
             frappe.logger().error(f"MCP Tool Not Found: {error_msg}")
             return {
                 "content": [{"type": "text", "text": error_msg}],
@@ -518,21 +535,23 @@ class MCPServer:
             fields_hidden = set()
             terms_replaced = 0
             
-            if settings and getattr(settings, "enable_business_output_normalizer", True):
+            enable_normalizer = getattr(settings, "enable_business_output_normalizer", True) if settings else True
+            if enable_normalizer:
                 # Count normalizations/hidden fields before converting to text
                 if isinstance(result, dict):
                     for hidden in HIDDEN_FIELDS:
                         if hidden in result:
                             fields_hidden.add(hidden)
                 
+                # Capture pre-normalization string representation
+                pre_str = str(result)
+                
                 # Normalize result
                 result = normalize_for_business_user(result)
 
-                # Count terms replaced in result text (approximate count for audit log)
-                original_str = str(result)
-                normalized_str = normalize_text(original_str)
-                if original_str != normalized_str:
-                    terms_replaced = 1
+                # Capture post-normalization string representation
+                post_str = str(result)
+                terms_replaced = 1 if pre_str != post_str else 0
 
             # Serialize result
             if isinstance(result, str):
@@ -561,11 +580,15 @@ class MCPServer:
                 )
 
             # Audit normalization
-            if settings and getattr(settings, "enable_business_output_normalizer", True):
+            if enable_normalizer:
+                try:
+                    user = frappe.session.user
+                except Exception:
+                    user = "System"
                 request_id = getattr(frappe.local, "assistant_session_id", None) or "unknown"
                 audit_tool_result_normalized(
                     tool_name=tool_name,
-                    user=frappe.session.user,
+                    user=user,
                     request_id=request_id,
                     fields_hidden=fields_hidden,
                     terms_replaced=terms_replaced,

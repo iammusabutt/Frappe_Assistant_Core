@@ -181,6 +181,10 @@ class AssistantCoreSettings(Document):
         except Exception as e:
             frappe.log_error(title=frappe._("Tool Cache Refresh Error"), message=str(e))
 
+        # Invalidate identity policy cache if mandatory skill changed
+        if self.has_value_changed("mandatory_identity_skill_id"):
+            frappe.cache.delete_key("fac_policy_identity_platia_identity")
+
     @frappe.whitelist()
     def get_plugin_status(self):
         """Get plugin status with a simplified view that links to FAC Admin for full control"""

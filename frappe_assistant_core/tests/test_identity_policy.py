@@ -208,3 +208,38 @@ class TestIdentityPolicy(BaseAssistantTest):
             from unittest.mock import patch
             with patch("frappe_assistant_core.policy.business_output_normalizer.normalize_text", return_value="frappe"):
                 enforce_final_output_policy("some raw text")
+
+    def test_normalizer_is_idempotent_on_compound_app_names(self):
+        """frappe_insights / frappe_crm style installed apps must not stack."""
+        from unittest.mock import patch
+        with patch("frappe.get_installed_apps", return_value=["frappe_insights", "frappe_crm"]):
+            from frappe_assistant_core.policy.business_output_normalizer import normalize_text
+            text = "Use frappe_insights for dashboards and frappe_crm for leads."
+            result = normalize_text(text)
+            self.assertEqual(result.count("Platia 360 Platia 360"), 0)
+            self.assertIn("Insights", result)
+            self.assertIn("CRM", result)
+
+    def test_normalizer_preserves_code_blocks(self):
+        from frappe_assistant_core.policy.business_output_normalizer import normalize_text
+        text = (
+            "Use frappe.db.sql like this:\n"
+            "```python\n"
+            "rows = frappe.db.get_all(\"Lead\")\n"
+            "```\n"
+            "frappe is also the module name in prose."
+        )
+        result = normalize_text(text)
+        self.assertIn("frappe.db.get_all", result)          # code untouched
+        self.assertIn("rows = frappe.db", result)            # code untouched
+        self.assertIn("Platia 360 is also the module", result)  # prose normalized
+
+    def test_normalizer_running_twice_is_stable(self):
+        """Running normalize_text on its own output must not change it further."""
+        from unittest.mock import patch
+        with patch("frappe.get_installed_apps", return_value=["frappe_insights", "frappe_crm"]):
+            from frappe_assistant_core.policy.business_output_normalizer import normalize_text
+            text = "frappe_insights and frappe_crm and plain frappe text."
+            once = normalize_text(text)
+            twice = normalize_text(once)
+            self.assertEqual(once, twice)

@@ -109,6 +109,11 @@ class ChatGPTFetch(BaseTool):
             doc = frappe.get_doc(doctype, name)
             doc_dict = filter_sensitive_fields(doc.as_dict(), doctype, user_role)
 
+            from frappe_assistant_core.policy.business_output_normalizer import (
+                normalize_for_business_user,
+            )
+            doc_dict = normalize_for_business_user(doc_dict)
+
             # Create title from name field or document name
             title = doc_dict.get("title") or doc_dict.get("name") or name
 

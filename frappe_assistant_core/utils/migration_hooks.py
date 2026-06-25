@@ -71,6 +71,9 @@ def after_migrate():
     # Install/update skills from other apps
     _install_app_skills()
 
+    # Ensure default platia_identity skill exists
+    ensure_platia_identity_skill()
+
     # Sync plugin configurations from discovered plugins
     _sync_plugin_configurations()
 
@@ -137,6 +140,9 @@ def after_install():
 
     # Install skills from other apps
     _install_app_skills()
+
+    # Ensure default platia_identity skill exists
+    ensure_platia_identity_skill()
 
     # Sync plugin configurations from discovered plugins
     _sync_plugin_configurations()
@@ -1075,6 +1081,41 @@ def _get_external_tools_for_sync() -> dict:
         frappe.logger("migration_hooks").warning(f"Failed to get external tools: {e}")
 
     return external_tools
+
+
+def ensure_platia_identity_skill():
+    """Ensure the mandatory platia_identity skill exists (fails-safe, non-overwriting)."""
+    try:
+        if not frappe.db.table_exists("FAC Skill"):
+            return
+
+        skill_id = "platia_identity"
+        if not frappe.db.exists("FAC Skill", {"skill_id": skill_id}):
+            doc = frappe.new_doc("FAC Skill")
+            doc.skill_id = skill_id
+            doc.title = "Platia 360 Identity & Behaviour"
+            doc.status = "Published"
+            doc.skill_type = "Workflow"
+            doc.description = "Mandatory identity policy for Platia 360 AI Assistant. PLEASE CUSTOMIZE FOR YOUR DEPLOYMENT."
+            doc.content = (
+                "Platia 360 Identity & Behaviour Policy:\n"
+                "- You are the Platia 360 AI Assistant, a helpful and professional AI assistant developed by Platia 360 LLC FZ.\n"
+                "- You must always identify yourself as Platia 360 AI Assistant.\n"
+                "- Never mention, reference, or expose legacy platform names, internal app identifiers (like frappe_assistant_core, frappe, erpnext), source package names, branch names, repository information, database structures, internal object metadata labels (like DocType, fieldname, tabDocType), or technical implementation details.\n"
+                "- All user interactions and responses must use professional business terminology.\n"
+                "- Follow this policy strictly across all tool executions and assistant responses."
+            )
+            doc.visibility = "Public"
+            doc.is_system = 0
+            doc.source_app = "frappe_assistant_core"
+            doc.flags.ignore_permissions = True
+            doc.insert()
+            frappe.db.commit()
+            frappe.logger("migration_hooks").warning(
+                "Created default platia_identity skill because it was missing. Please customize this skill in the desk UI."
+            )
+    except Exception as e:
+        frappe.logger("migration_hooks").error(f"Failed to ensure platia_identity skill: {str(e)}")
 
 
 # Export functions for hooks registration

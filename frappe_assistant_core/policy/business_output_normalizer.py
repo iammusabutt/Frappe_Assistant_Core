@@ -29,6 +29,20 @@ RAW_TO_SAFE_TOOL_NAMES = {
 
 SAFE_TO_RAW_TOOL_NAMES = {v: k for k, v in RAW_TO_SAFE_TOOL_NAMES.items()}
 
+# Matches a fenced code block (```...```) or inline code (`...`).
+# Fenced blocks are matched non-greedily across newlines; inline code
+# excludes backticks and newlines so it doesn't swallow whole paragraphs.
+_CODE_SPAN_RE = re.compile(r"```.*?```|`[^`\n]*`", re.DOTALL)
+
+# Collapses two-or-more consecutive copies of a brand token that may have
+# been produced by earlier (already-stored) corruption or by future alias
+# overlap, e.g. "Platia 360 Platia 360 Platia 360 Insights" -> "Platia 360 Insights".
+_BRAND = "Platia 360"
+_BRAND_REPEAT_RE = re.compile(
+    r"(?:" + re.escape(_BRAND) + r"\s+){2,}", re.IGNORECASE
+)
+
+
 def get_business_alias_map():
     """Build a comprehensive dictionary of legacy/technical names to business-safe terms."""
     alias_map = {}
@@ -36,30 +50,26 @@ def get_business_alias_map():
     def add_variations(key, val):
         if not key:
             return
-        alias_map[key] = val
-        alias_map[key.lower()] = val
-        alias_map[key.upper()] = val
-        
-        # Spaces
-        spaced = key.replace("_", " ").replace("-", " ")
-        alias_map[spaced] = val
-        alias_map[spaced.lower()] = val
-        alias_map[spaced.upper()] = val
-        alias_map[spaced.title()] = val
-        
-        # Kebab
-        kebab = key.replace("_", "-").replace(" ", "-")
-        alias_map[kebab] = val
-        alias_map[kebab.lower()] = val
-        alias_map[kebab.upper()] = val
-        
-        # Snake
-        snake = key.replace("-", "_").replace(" ", "_")
-        alias_map[snake] = val
-        alias_map[snake.lower()] = val
-        alias_map[snake.upper()] = val
+        variants = set()
+        variants.add(key)
+        variants.add(key.lower())
+        variants.add(key.upper())
 
-    # Base legacy platform terms
+        spaced = key.replace("_", " ").replace("-", " ")
+        variants.update({spaced, spaced.lower(), spaced.upper(), spaced.title()})
+
+        kebab = key.replace("_", "-").replace(" ", "-")
+        variants.update({kebab, kebab.lower(), kebab.upper()})
+
+        snake = key.replace("-", "_").replace(" ", "_")
+        variants.update({snake, snake.lower(), snake.upper()})
+
+        for v in variants:
+            # Don't let a shorter/earlier alias's OWN replacement value collide
+            # with a later key. We only register raw legacy text as a key here;
+            # replacement values are never fed back into the map.
+            alias_map[v] = val
+
     base_rules = [
         ("frappe_assistant_core", "Platia 360 AI Assistant"),
         ("frappe", "Platia 360"),
@@ -68,7 +78,6 @@ def get_business_alias_map():
         ("doctypes", "object types"),
         ("doc_type", "object type"),
         ("doc_types", "object types"),
-        # common misspellings / variants
         ("frapp", "Platia 360"),
         ("frap", "Platia 360"),
         ("erpnxt", "Platia 360"),
@@ -78,54 +87,107 @@ def get_business_alias_map():
     for key, val in base_rules:
         add_variations(key, val)
 
-    # Installed apps
+    # Installed apps. Business name is built WITHOUT reusing words that are
+    # already brand-mapped (e.g. don't produce "Platia 360 Frappe Insights" -
+    # produce "Platia 360 Insights"), so the replacement value can never
+    # re-trigger another rule in this same map.
     try:
+        already_mapped_words = {"frappe", "erpnext", "platia", "360"}
         for app in frappe.get_installed_apps():
-            if app not in ("frappe", "erpnext", "frappe_assistant_core"):
-                parts = app.split("_")
-                cleaned_parts = []
-                for p in parts:
-                    if p.lower() in ("ai", "crm", "hr", "mcp"):
-                        cleaned_parts.append(p.upper())
-                    else:
-                        cleaned_parts.append(p.capitalize())
-                title_case = " ".join(cleaned_parts)
-                business_name = f"Platia 360 {title_case}"
-                add_variations(app, business_name)
+            if app in ("frappe", "erpnext", "frappe_assistant_core"):
+                continue
+            parts = app.split("_")
+            cleaned_parts = []
+            for p in parts:
+                if p.lower() in already_mapped_words:
+                    continue  # drop "frappe" out of "frappe_insights" etc.
+                if p.lower() in ("ai", "crm", "hr", "mcp"):
+                    cleaned_parts.append(p.upper())
+                else:
+                    cleaned_parts.append(p.capitalize())
+            title_case = " ".join(cleaned_parts).strip()
+            business_name = f"Platia 360 {title_case}".strip() if title_case else "Platia 360"
+            add_variations(app, business_name)
     except Exception:
         pass
 
     return alias_map
 
+
 def reverse_tool_name_mapping(name):
     """Map a business safe tool name back to the internal tool name."""
     return SAFE_TO_RAW_TOOL_NAMES.get(name, name)
+
 
 def is_hidden_field(key: str) -> bool:
     """Check if the key is in the forbidden hidden fields list."""
     if not key:
         return False
-    normalized = str(key).strip().lower()
+    normalized = str(key).strip().lower().replace(" ", "_").replace("-", "_")
     return normalized in HIDDEN_FIELDS
 
+
+def _build_alias_regex(alias_map: dict):
+    """
+    Build ONE compiled regex covering every alias key, longest-first so
+    multi-word phrases win over single-word substrings.
+    """
+    keys = [k for k in alias_map.keys() if k and len(k) >= 2]
+    if not keys:
+        return None
+    keys.sort(key=len, reverse=True)
+    parts = []
+    for k in keys:
+        escaped = re.escape(k)
+        prefix = r"\b" if (k[0].isalnum() or k[0] == "_") else ""
+        suffix = r"\b" if (k[-1].isalnum() or k[-1] == "_") else ""
+        parts.append(prefix + escaped + suffix)
+    pattern = "|".join(parts)
+    return re.compile(pattern, flags=re.IGNORECASE)
+
+
+def _normalize_prose(text: str, alias_map: dict, regex) -> str:
+    if not text or regex is None:
+        return text
+
+    def _replace(match):
+        matched = match.group(0)
+        # Case-insensitive lookup: try exact, then lowercase fallback.
+        return alias_map.get(matched, alias_map.get(matched.lower(), matched))
+
+    result = regex.sub(_replace, text)
+    # Safety net: collapse any accidental repeated brand prefix.
+    result = _BRAND_REPEAT_RE.sub(_BRAND + " ", result)
+    return result
+
+
 def normalize_text(value: str) -> str:
-    """Replace legacy/technical terms with business aliases."""
+    """
+    Replace legacy/technical terms with business aliases in prose,
+    while leaving fenced/inline code spans untouched so code samples
+    (e.g. frappe.db.sql(...)) stay syntactically valid.
+    """
     if not value:
         return value
 
     text = str(value)
     alias_map = get_business_alias_map()
-    
-    # Sort keys by length descending to replace longer phrases first
-    sorted_keys = sorted(alias_map.keys(), key=len, reverse=True)
-    
-    for raw in sorted_keys:
-        if not raw or len(raw) < 2:
-            continue
-        # Use regex replacement to match exactly case-insensitively
-        text = re.sub(re.escape(raw), alias_map[raw], text, flags=re.IGNORECASE)
+    regex = _build_alias_regex(alias_map)
+    if regex is None:
+        return text
 
-    return text
+    # Split into alternating [prose, code, prose, code, ...] segments.
+    # Code spans (fenced or inline) are passed through verbatim.
+    pieces = []
+    last_end = 0
+    for m in _CODE_SPAN_RE.finditer(text):
+        prose_chunk = text[last_end:m.start()]
+        pieces.append(_normalize_prose(prose_chunk, alias_map, regex))
+        pieces.append(m.group(0))  # code span, untouched
+        last_end = m.end()
+    pieces.append(_normalize_prose(text[last_end:], alias_map, regex))
+
+    return "".join(pieces)
 
 def normalize_for_business_user(value):
     """Recursively clean dictionaries, lists, and strings of technical terminology."""
